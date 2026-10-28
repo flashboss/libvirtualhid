@@ -96,7 +96,16 @@ namespace {
     if (!mouse_environment()) {
       return CGWarpMouseCursorPosition(point);
     }
+    mouse_environment()->cursor_location = {.x = point.x, .y = point.y};
     mouse_environment()->warped_location = {.x = point.x, .y = point.y};
+    return kCGErrorSuccess;
+  }
+
+  CGError mouse_display_hide_cursor(CGDirectDisplayID) {
+    return kCGErrorSuccess;
+  }
+
+  CGError mouse_display_show_cursor(CGDirectDisplayID) {
     return kCGErrorSuccess;
   }
 
@@ -121,9 +130,13 @@ namespace {
 #define CGEventPost mouse_event_post
 #define CGEventPostToPid mouse_event_post_to_pid
 #define CGWarpMouseCursorPosition mouse_warp_cursor_position
+#define CGDisplayHideCursor mouse_display_hide_cursor
+#define CGDisplayShowCursor mouse_display_show_cursor
 #define create_platform_backend create_platform_backend_for_macos_backend_test_hooks
 #include "../../src/platform/macos/macos_backend.cpp"
 #undef create_platform_backend
+#undef CGDisplayShowCursor
+#undef CGDisplayHideCursor
 #undef CGWarpMouseCursorPosition
 #undef CGEventPostToPid
 #undef CGEventPost

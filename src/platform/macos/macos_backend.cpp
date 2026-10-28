@@ -20,6 +20,7 @@
 #include <Carbon/Carbon.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <IOKit/hidsystem/IOLLEvent.h>
+#include <dispatch/dispatch.h>
 
 // local includes
 #include "core/backend.hpp"
@@ -29,6 +30,17 @@ namespace lvh::detail {
   namespace macos {
 
     constexpr auto multi_click_delay = std::chrono::milliseconds(500);  ///< Maximum double-click gap.
+    /**
+     * @brief Minimum gap between desktop cursor samples for a targeted process.
+     *
+     * Apps such as SDL/ScummVM read the system cursor, so targeted delivery warps there, dwells long
+     * enough for a poll (~1 display frame), then restores. Continuous immediate warp/restore never
+     * lets SDL observe the sample and freezes the Mac mouse if unthrottled.
+     */
+    // ~30 Hz: smooth enough for SDL, and leaves room to restore so the Mac cursor stays put.
+    // Faster sampling or force-sampling large jumps overlapped restores and dragged the host cursor.
+    constexpr auto targeted_cursor_sample_interval = std::chrono::milliseconds(33);
+    constexpr auto targeted_cursor_sample_dwell = std::chrono::milliseconds(16);  ///< Time SDL needs to observe the warp.
     constexpr int wheel_delta = 120;  ///< Windows-style high-resolution wheel delta.
     constexpr double default_scrollwheel_scaling = 0.3125;  ///< Default macOS scroll speed slider position.
     constexpr int default_scroll_lines_per_detent = 5;  ///< Logical lines represented by one default wheel detent.
@@ -528,39 +540,6 @@ namespace lvh::detail {
 
     std::atomic<pid_t> event_target_pid {0};  ///< Process that receives events without being activated. Zero keeps system-wide delivery.
     std::atomic<std::uint32_t> event_target_window {0};  ///< Window that should receive posted mouse events. Zero leaves hit testing unchanged.
-    std::mutex cursor_borrow_mutex;  ///< Guards the borrowed system-cursor state used for targeted mouse delivery.
-    bool cursor_detached {false};  ///< Whether the on-screen cursor was disconnected from mouse motion.
-    CGPoint saved_cursor {};  ///< On-screen cursor position to restore when targeting ends.
-
-    /**
-     * @brief Disconnect the visible Mac cursor so warps for a captured app do not drag it across the desktop.
-     */
-    void borrow_cursor_for_target() {
-      std::lock_guard lock {cursor_borrow_mutex};
-      if (cursor_detached) {
-        return;
-      }
-      const auto snapshot = CGEventCreate(nullptr);
-      if (snapshot != nullptr) {
-        saved_cursor = CGEventGetLocation(snapshot);
-        CFRelease(snapshot);
-      }
-      CGAssociateMouseAndMouseCursorPosition(false);
-      cursor_detached = true;
-    }
-
-    /**
-     * @brief Put the visible Mac cursor back where the local user left it.
-     */
-    void release_borrowed_cursor() {
-      std::lock_guard lock {cursor_borrow_mutex};
-      if (!cursor_detached) {
-        return;
-      }
-      CGWarpMouseCursorPosition(saved_cursor);
-      CGAssociateMouseAndMouseCursorPosition(true);
-      cursor_detached = false;
-    }
 
     /**
      * @brief Send later CoreGraphics events to one process without activating it.
@@ -568,11 +547,7 @@ namespace lvh::detail {
      * @param pid Process id, or zero to deliver events to whichever application is active.
      */
     void set_event_target_pid(std::int32_t pid) {
-      const auto next = pid > 0 ? static_cast<pid_t>(pid) : 0;
-      const auto previous = event_target_pid.exchange(next, std::memory_order_relaxed);
-      if (previous > 0 && next == 0) {
-        release_borrowed_cursor();
-      }
+      event_target_pid.store(pid > 0 ? static_cast<pid_t>(pid) : 0, std::memory_order_relaxed);
     }
 
     /**
@@ -906,14 +881,60 @@ namespace lvh::detail {
 
         const auto pid = current_event_target_pid();
         if (pid > 0) {
-          // ScummVM and other SDL apps read the system cursor. Posting only to the process leaves their pointer stuck.
-          // Disconnect the visible Mac cursor, warp the logical pointer into the captured window, then post normally.
-          borrow_cursor_for_target();
-          CGWarpMouseCursorPosition(location);
-          CGEventSetIntegerValueField(event, kCGEventTargetUnixProcessID, pid);
-          CGEventPost(kCGHIDEventTap, event);
+          // AppKit hit-tests mouse against the WindowServer pointer, so CGEventPostToPid silently
+          // drops clicks. Targeted delivery warps onto the capture window, posts through the HID tap
+          // (same path as a real mouse), then restores. The cursor is hidden for the sample so the
+          // Mac user does not see the jump. Sample at ~30 Hz and on every button edge; serialize so
+          // overlapping warps cannot leave the host cursor on the phone path.
+          const bool button_edge =
+            type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp ||
+            type == kCGEventRightMouseDown || type == kCGEventRightMouseUp ||
+            type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp;
+          const auto now = std::chrono::steady_clock::now();
+          const bool interval_elapsed = now - last_targeted_cursor_sample_ >= targeted_cursor_sample_interval;
+          const bool sample_busy = targeted_cursor_sample_busy_.load(std::memory_order_acquire);
+          const bool should_sample = button_edge || (!sample_busy && interval_elapsed);
+          const auto sample_location = location;
+
           injected_location_ = location;
           injected_pid_ = pid;
+          if (!should_sample) {
+            // Throttled absolute moves only update the virtual pointer; SDL reads the next sample.
+            return OperationStatus::success();
+          }
+
+          // Keep restoring to the pre-sample host cursor. Refresh the anchor only when idle so a
+          // click that arrives mid-sample does not treat the phone warp as the Mac home position.
+          if (!sample_busy || !targeted_cursor_host_anchor_) {
+            targeted_cursor_host_anchor_ = current_location();
+          }
+          const auto host_location = *targeted_cursor_host_anchor_;
+          last_targeted_cursor_sample_ = now;
+          last_targeted_cursor_sample_location_ = location;
+          targeted_cursor_sample_busy_.store(true, std::memory_order_release);
+          const auto sample_generation = targeted_cursor_sample_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+
+          if (targeted_cursor_hide_depth_.fetch_add(1, std::memory_order_acq_rel) == 0) {
+            CGDisplayHideCursor(CGMainDisplayID());
+          }
+          CGWarpMouseCursorPosition(sample_location);
+          CGEventPost(kCGHIDEventTap, event);
+
+          const auto dwell_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(targeted_cursor_sample_dwell).count();
+          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, dwell_ns), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            const bool latest_sample = targeted_cursor_sample_generation_.load(std::memory_order_acquire) == sample_generation;
+            // Only the latest sample restores the host cursor; an older restore must not pull the
+            // pointer away while a click sample is still on the capture window.
+            if (latest_sample) {
+              CGWarpMouseCursorPosition(host_location);
+            }
+            if (targeted_cursor_hide_depth_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+              CGDisplayShowCursor(CGMainDisplayID());
+            }
+            if (latest_sample) {
+              targeted_cursor_sample_busy_.store(false, std::memory_order_release);
+            }
+          });
         } else {
           post_cg_event(kCGHIDEventTap, event);
           CGWarpMouseCursorPosition(location);
@@ -999,6 +1020,12 @@ namespace lvh::detail {
       std::array<bool, 3> mouse_down_ {};
       mutable std::optional<CGPoint> injected_location_;  ///< Last location delivered to a selected process.
       mutable pid_t injected_pid_ {0};  ///< Process that owns injected_location_.
+      mutable std::chrono::steady_clock::time_point last_targeted_cursor_sample_ {};  ///< Last warp sample for SDL-style cursors.
+      mutable std::optional<CGPoint> last_targeted_cursor_sample_location_ {};  ///< Last warp destination (diagnostics / future use).
+      mutable std::optional<CGPoint> targeted_cursor_host_anchor_ {};  ///< Mac cursor to restore after a sample.
+      mutable std::atomic_bool targeted_cursor_sample_busy_ {false};  ///< True while a warp/restore sample is in flight.
+      mutable std::atomic_uint64_t targeted_cursor_sample_generation_ {0};  ///< Monotonic id so stale restores cannot undo a newer sample.
+      mutable std::atomic_int targeted_cursor_hide_depth_ {0};  ///< Nested CGDisplayHideCursor depth for in-flight samples.
       std::array<std::array<std::chrono::steady_clock::time_point, 2>, 3> last_mouse_event_ {};
       std::mutex mutex_;
       bool open_ = true;

@@ -383,7 +383,7 @@ TEST_F(MacosBackendTest, ReportsCapabilitiesAndUnsupportedDevices) {
   EXPECT_EQ(result.pen_tablet_status.code(), lvh::ErrorCode::unsupported_profile);
 }
 
-TEST_F(MacosBackendTest, PostsMouseToTargetProcessByWarpingTheLogicalCursor) {
+TEST_F(MacosBackendTest, PostsMouseToTargetProcessAndRestoresDesktopCursor) {
   const lvh::PointerViewport viewport {.offset_x = 100, .offset_y = 200, .width = 640, .height = 480};
   const lvh::MouseEvent move {
     .kind = lvh::MouseEventKind::absolute_motion,
@@ -399,18 +399,31 @@ TEST_F(MacosBackendTest, PostsMouseToTargetProcessByWarpingTheLogicalCursor) {
   };
   const std::vector<lvh::detail::test::MacosMouseSubmission> submissions {
     {.display_bounds = {0, 0, 1920, 1080}, .cursor_location = {10, 10}, .event = move},
+    {.display_bounds = {0, 0, 1920, 1080}, .cursor_location = {10, 10}, .event = move},
     {.display_bounds = {0, 0, 1920, 1080}, .cursor_location = {10, 10}, .event = click},
   };
   const auto results = lvh::detail::test::macos_backend_mouse_submissions(viewport, {0, 0, 1920, 1080}, submissions, 4242);
 
-  ASSERT_EQ(results.size(), 2U);
+  ASSERT_EQ(results.size(), 3U);
   for (const auto &result : results) {
     ASSERT_TRUE(result.status.ok()) << result.status.message();
-    ASSERT_TRUE(result.posted_location);
-    ASSERT_TRUE(result.warped_location);
-    EXPECT_DOUBLE_EQ(result.posted_location->x, 420);
-    EXPECT_DOUBLE_EQ(result.posted_location->y, 440);
-    EXPECT_DOUBLE_EQ(result.warped_location->x, 420);
-    EXPECT_DOUBLE_EQ(result.warped_location->y, 440);
   }
+
+  // Targeted mouse posts through the HID tap while the cursor is warped so AppKit accepts clicks.
+  ASSERT_TRUE(results[0].posted_location.has_value());
+  EXPECT_DOUBLE_EQ(results[0].posted_location->x, 420);
+  EXPECT_DOUBLE_EQ(results[0].posted_location->y, 440);
+  ASSERT_TRUE(results[0].warped_location.has_value());
+  EXPECT_DOUBLE_EQ(results[0].warped_location->x, 420);
+  EXPECT_DOUBLE_EQ(results[0].warped_location->y, 440);
+  // Immediate follow-up motion stays within the sample throttle and must not fight the host mouse.
+  EXPECT_FALSE(results[1].posted_location.has_value());
+  EXPECT_FALSE(results[1].warped_location.has_value());
+  // Button edges always sample so click hit-testing sees the virtual pointer.
+  ASSERT_TRUE(results[2].posted_location.has_value());
+  EXPECT_DOUBLE_EQ(results[2].posted_location->x, 420);
+  EXPECT_DOUBLE_EQ(results[2].posted_location->y, 440);
+  ASSERT_TRUE(results[2].warped_location.has_value());
+  EXPECT_DOUBLE_EQ(results[2].warped_location->x, 420);
+  EXPECT_DOUBLE_EQ(results[2].warped_location->y, 440);
 }
