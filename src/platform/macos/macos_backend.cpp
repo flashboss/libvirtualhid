@@ -29,18 +29,34 @@
 namespace lvh::detail {
   namespace macos {
 
+    // Without SetsCursorInBackground, CGDisplayHideCursor only works while this process is frontmost.
+    using CGSConnectionID = int;
+    extern "C" CGSConnectionID _CGSDefaultConnection(void);
+    extern "C" CGError CGSSetConnectionProperty(CGSConnectionID cid, CGSConnectionID target_cid, CFStringRef key, CFTypeRef value);
+
+    /**
+     * @brief Let CGDisplayHideCursor work while Sunshine is not the frontmost app.
+     */
+    void enable_background_cursor_hide() {
+      static const bool enabled = [] {
+        const auto connection = _CGSDefaultConnection();
+        return CGSSetConnectionProperty(connection, connection, CFSTR("SetsCursorInBackground"), kCFBooleanTrue) == kCGErrorSuccess;
+      }();
+      static_cast<void>(enabled);
+    }
+
     constexpr auto multi_click_delay = std::chrono::milliseconds(500);  ///< Maximum double-click gap.
     /**
-     * @brief Minimum gap between desktop cursor samples for a targeted process.
+     * @brief Targeted cursor sampling for apps (ScummVM) that poll the desktop pointer.
      *
-     * Apps such as SDL/ScummVM read the system cursor, so targeted delivery warps there, dwells long
-     * enough for a poll (~1 display frame), then restores. Continuous immediate warp/restore never
-     * lets SDL observe the sample and freezes the Mac mouse if unthrottled.
+     * ScummVM follows the desktop pointer, so remote motion warps onto the capture surface while the
+     * system cursor stays hidden and local mouse stays dissociated. Restoring the host position after
+     * every sample teleports the Mac cursor along the phone path (visible thrash); the host anchor is
+     * restored only after remote mouse idle instead. Hide is re-asserted on every sample because the
+     * target app may call CGDisplayShowCursor.
      */
-    // ~30 Hz: smooth enough for SDL, and leaves room to restore so the Mac cursor stays put.
-    // Faster sampling or force-sampling large jumps overlapped restores and dragged the host cursor.
     constexpr auto targeted_cursor_sample_interval = std::chrono::milliseconds(33);
-    constexpr auto targeted_cursor_sample_dwell = std::chrono::milliseconds(16);  ///< Time SDL needs to observe the warp.
+    constexpr auto targeted_cursor_idle = std::chrono::milliseconds(250);  ///< Restore/show the Mac cursor after remote mouse goes quiet.
     constexpr int wheel_delta = 120;  ///< Windows-style high-resolution wheel delta.
     constexpr double default_scrollwheel_scaling = 0.3125;  ///< Default macOS scroll speed slider position.
     constexpr int default_scroll_lines_per_detent = 5;  ///< Logical lines represented by one default wheel detent.
@@ -881,65 +897,103 @@ namespace lvh::detail {
 
         const auto pid = current_event_target_pid();
         if (pid > 0) {
-          // AppKit hit-tests mouse against the WindowServer pointer, so CGEventPostToPid silently
-          // drops clicks. Targeted delivery warps onto the capture window, posts through the HID tap
-          // (same path as a real mouse), then restores. The cursor is hidden for the sample so the
-          // Mac user does not see the jump. Sample at ~30 Hz and on every button edge; serialize so
-          // overlapping warps cannot leave the host cursor on the phone path.
-          const bool button_edge =
-            type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp ||
-            type == kCGEventRightMouseDown || type == kCGEventRightMouseUp ||
-            type == kCGEventOtherMouseDown || type == kCGEventOtherMouseUp;
+          // PostToPid for delivery. ScummVM follows the desktop pointer, so keep a hidden on-target
+          // warp for the whole remote-activity window and only restore the frozen host anchor on idle.
+          // Per-sample restore thrash is what makes the Mac cursor visibly follow the phone.
+          const bool button_down =
+            type == kCGEventLeftMouseDown || type == kCGEventRightMouseDown || type == kCGEventOtherMouseDown;
+          const bool button_up =
+            type == kCGEventLeftMouseUp || type == kCGEventRightMouseUp || type == kCGEventOtherMouseUp;
+          const bool button_edge = button_down || button_up;
+          const bool buttons_held = mouse_down_[0] || mouse_down_[1] || mouse_down_[2];
           const auto now = std::chrono::steady_clock::now();
           const bool interval_elapsed = now - last_targeted_cursor_sample_ >= targeted_cursor_sample_interval;
-          const bool sample_busy = targeted_cursor_sample_busy_.load(std::memory_order_acquire);
-          const bool should_sample = button_edge || (!sample_busy && interval_elapsed);
-          const auto sample_location = location;
+          const bool should_sample = button_edge || buttons_held || interval_elapsed;
 
           injected_location_ = location;
           injected_pid_ = pid;
+          last_targeted_activity_ = now;
+
+          if (!targeted_cursor_host_anchor_ && !targeted_cursor_hidden_.load(std::memory_order_acquire)) {
+            targeted_cursor_host_anchor_ = current_location();
+          }
+
+          CGEventSetIntegerValueField(event, kCGEventTargetUnixProcessID, pid);
           if (!should_sample) {
-            // Throttled absolute moves only update the virtual pointer; SDL reads the next sample.
+            CGEventPostToPid(pid, event);
+            schedule_targeted_cursor_idle_restore();
             return OperationStatus::success();
           }
 
-          // Keep restoring to the pre-sample host cursor. Refresh the anchor only when idle so a
-          // click that arrives mid-sample does not treat the phone warp as the Mac home position.
-          if (!sample_busy || !targeted_cursor_host_anchor_) {
+          if (!targeted_cursor_host_anchor_) {
             targeted_cursor_host_anchor_ = current_location();
           }
-          const auto host_location = *targeted_cursor_host_anchor_;
           last_targeted_cursor_sample_ = now;
-          last_targeted_cursor_sample_location_ = location;
-          targeted_cursor_sample_busy_.store(true, std::memory_order_release);
-          const auto sample_generation = targeted_cursor_sample_generation_.fetch_add(1, std::memory_order_acq_rel) + 1;
+          targeted_cursor_sample_generation_.fetch_add(1, std::memory_order_acq_rel);
 
-          if (targeted_cursor_hide_depth_.fetch_add(1, std::memory_order_acq_rel) == 0) {
-            CGDisplayHideCursor(CGMainDisplayID());
+          if (!targeted_cursor_hidden_.exchange(true, std::memory_order_acq_rel)) {
+            enable_background_cursor_hide();
+            CGAssociateMouseAndMouseCursorPosition(false);
           }
-          CGWarpMouseCursorPosition(sample_location);
-          CGEventPost(kCGHIDEventTap, event);
+          // Re-assert hide every sample; ScummVM/SDL may undo a single CGDisplayHideCursor.
+          CGDisplayHideCursor(kCGDirectMainDisplay);
+          targeted_cursor_hide_depth_.fetch_add(1, std::memory_order_acq_rel);
 
-          const auto dwell_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(targeted_cursor_sample_dwell).count();
-          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, dwell_ns), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-            const bool latest_sample = targeted_cursor_sample_generation_.load(std::memory_order_acquire) == sample_generation;
-            // Only the latest sample restores the host cursor; an older restore must not pull the
-            // pointer away while a click sample is still on the capture window.
-            if (latest_sample) {
-              CGWarpMouseCursorPosition(host_location);
+          if (button_edge && button_down) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+            ProcessSerialNumber psn {};
+            if (GetProcessForPID(pid, &psn) == noErr) {
+              SetFrontProcessWithOptions(&psn, kSetFrontProcessFrontWindowOnly);
             }
-            if (targeted_cursor_hide_depth_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-              CGDisplayShowCursor(CGMainDisplayID());
-            }
-            if (latest_sample) {
-              targeted_cursor_sample_busy_.store(false, std::memory_order_release);
-            }
-          });
+#pragma clang diagnostic pop
+            CGDisplayHideCursor(kCGDirectMainDisplay);
+            targeted_cursor_hide_depth_.fetch_add(1, std::memory_order_acq_rel);
+          }
+
+          if (button_edge) {
+            CGWarpMouseCursorPosition(location);
+            CGEventPostToPid(pid, event);
+          } else {
+            CGEventPostToPid(pid, event);
+            CGWarpMouseCursorPosition(location);
+          }
+
+          schedule_targeted_cursor_idle_restore();
         } else {
           post_cg_event(kCGHIDEventTap, event);
           CGWarpMouseCursorPosition(location);
         }
         return OperationStatus::success();
+      }
+
+      /**
+       * @brief Restore the Mac cursor after targeted remote mouse activity goes quiet.
+       */
+      void schedule_targeted_cursor_idle_restore() const {
+        const auto idle_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(targeted_cursor_idle).count();
+        const auto generation = targeted_cursor_sample_generation_.load(std::memory_order_acquire);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, idle_ns), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+          if (targeted_cursor_sample_generation_.load(std::memory_order_acquire) != generation) {
+            return;
+          }
+          if (mouse_down_[0] || mouse_down_[1] || mouse_down_[2]) {
+            return;
+          }
+          if (std::chrono::steady_clock::now() - last_targeted_activity_ < targeted_cursor_idle) {
+            return;
+          }
+          if (targeted_cursor_host_anchor_) {
+            CGWarpMouseCursorPosition(*targeted_cursor_host_anchor_);
+            targeted_cursor_host_anchor_.reset();
+          }
+          CGAssociateMouseAndMouseCursorPosition(true);
+          if (targeted_cursor_hidden_.exchange(false, std::memory_order_acq_rel)) {
+            for (auto depth = targeted_cursor_hide_depth_.exchange(0, std::memory_order_acq_rel); depth > 0; --depth) {
+              CGDisplayShowCursor(kCGDirectMainDisplay);
+            }
+          }
+        });
       }
 
       /**
@@ -1018,14 +1072,14 @@ namespace lvh::detail {
       PointerViewport viewport_;  ///< Requested screen geometry, with zero dimensions selecting the current main display.
       CGRect viewport_bounds_ {};  ///< CoreGraphics bounds resolved for the current mouse submission.
       std::array<bool, 3> mouse_down_ {};
-      mutable std::optional<CGPoint> injected_location_;  ///< Last location delivered to a selected process.
+      mutable std::optional<CGPoint> injected_location_;  ///< Last virtual pointer location for a selected process.
       mutable pid_t injected_pid_ {0};  ///< Process that owns injected_location_.
-      mutable std::chrono::steady_clock::time_point last_targeted_cursor_sample_ {};  ///< Last warp sample for SDL-style cursors.
-      mutable std::optional<CGPoint> last_targeted_cursor_sample_location_ {};  ///< Last warp destination (diagnostics / future use).
-      mutable std::optional<CGPoint> targeted_cursor_host_anchor_ {};  ///< Mac cursor to restore after a sample.
-      mutable std::atomic_bool targeted_cursor_sample_busy_ {false};  ///< True while a warp/restore sample is in flight.
-      mutable std::atomic_uint64_t targeted_cursor_sample_generation_ {0};  ///< Monotonic id so stale restores cannot undo a newer sample.
-      mutable std::atomic_int targeted_cursor_hide_depth_ {0};  ///< Nested CGDisplayHideCursor depth for in-flight samples.
+      mutable std::chrono::steady_clock::time_point last_targeted_cursor_sample_ {};  ///< Last on-target warp sample.
+      mutable std::chrono::steady_clock::time_point last_targeted_activity_ {};  ///< Last targeted mouse event from the client.
+      mutable std::optional<CGPoint> targeted_cursor_host_anchor_ {};  ///< Host pointer frozen for the remote-activity window and restored on idle.
+      mutable std::atomic_uint64_t targeted_cursor_sample_generation_ {0};  ///< Drops stale idle restores after newer remote activity.
+      mutable std::atomic_bool targeted_cursor_hidden_ {false};  ///< True while the system cursor is hidden for remote mouse activity.
+      mutable std::atomic_int targeted_cursor_hide_depth_ {0};  ///< Matching CGDisplayHideCursor calls to undo on idle.
       std::array<std::array<std::chrono::steady_clock::time_point, 2>, 3> last_mouse_event_ {};
       std::mutex mutex_;
       bool open_ = true;

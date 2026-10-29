@@ -109,6 +109,10 @@ namespace {
     return kCGErrorSuccess;
   }
 
+  boolean_t mouse_associate_mouse_and_mouse_cursor_position(boolean_t) {
+    return true;
+  }
+
   void mouse_event_post_to_pid(pid_t pid, CGEventRef event) {
     if (!mouse_environment()) {
       CGEventPostToPid(pid, event);
@@ -121,6 +125,14 @@ namespace {
 
 }  // namespace
 
+extern "C" int mouse_cgs_default_connection() {
+  return 1;
+}
+
+extern "C" CGError mouse_cgs_set_connection_property(int, int, CFStringRef, CFTypeRef) {
+  return kCGErrorSuccess;
+}
+
 // Load the backend's dependencies before these macros, then compile it in a
 // separate namespace so instrumented inline symbols remain isolated.
 #define macos macos_backend_test
@@ -132,9 +144,15 @@ namespace {
 #define CGWarpMouseCursorPosition mouse_warp_cursor_position
 #define CGDisplayHideCursor mouse_display_hide_cursor
 #define CGDisplayShowCursor mouse_display_show_cursor
+#define CGAssociateMouseAndMouseCursorPosition mouse_associate_mouse_and_mouse_cursor_position
+#define _CGSDefaultConnection mouse_cgs_default_connection
+#define CGSSetConnectionProperty mouse_cgs_set_connection_property
 #define create_platform_backend create_platform_backend_for_macos_backend_test_hooks
 #include "../../src/platform/macos/macos_backend.cpp"
 #undef create_platform_backend
+#undef CGSSetConnectionProperty
+#undef _CGSDefaultConnection
+#undef CGAssociateMouseAndMouseCursorPosition
 #undef CGDisplayShowCursor
 #undef CGDisplayHideCursor
 #undef CGWarpMouseCursorPosition

@@ -409,21 +409,19 @@ TEST_F(MacosBackendTest, PostsMouseToTargetProcessAndRestoresDesktopCursor) {
     ASSERT_TRUE(result.status.ok()) << result.status.message();
   }
 
-  // Targeted mouse posts through the HID tap while the cursor is warped so AppKit accepts clicks.
+  // Targeted motion posts to the process and briefly warps (hidden) so ScummVM's software cursor moves.
   ASSERT_TRUE(results[0].posted_location.has_value());
+  ASSERT_TRUE(results[0].posted_pid.has_value());
   EXPECT_DOUBLE_EQ(results[0].posted_location->x, 420);
   EXPECT_DOUBLE_EQ(results[0].posted_location->y, 440);
+  EXPECT_EQ(*results[0].posted_pid, 4242);
   ASSERT_TRUE(results[0].warped_location.has_value());
   EXPECT_DOUBLE_EQ(results[0].warped_location->x, 420);
   EXPECT_DOUBLE_EQ(results[0].warped_location->y, 440);
-  // Immediate follow-up motion stays within the sample throttle and must not fight the host mouse.
-  EXPECT_FALSE(results[1].posted_location.has_value());
+  ASSERT_TRUE(results[1].posted_location.has_value());
+  EXPECT_EQ(*results[1].posted_pid, 4242);
   EXPECT_FALSE(results[1].warped_location.has_value());
-  // Button edges always sample so click hit-testing sees the virtual pointer.
   ASSERT_TRUE(results[2].posted_location.has_value());
-  EXPECT_DOUBLE_EQ(results[2].posted_location->x, 420);
-  EXPECT_DOUBLE_EQ(results[2].posted_location->y, 440);
+  EXPECT_EQ(*results[2].posted_pid, 4242);
   ASSERT_TRUE(results[2].warped_location.has_value());
-  EXPECT_DOUBLE_EQ(results[2].warped_location->x, 420);
-  EXPECT_DOUBLE_EQ(results[2].warped_location->y, 440);
 }
